@@ -1,5 +1,5 @@
-# M5_NightscoutMon
-## M5Stack Nightscout monitor
+# M5_NightscoutMon_GSM
+## M5Stack Nightscout monitor with GSM/GPRS support
 
 ##### M5Stack Nightscout monitor<br/>Copyright (C) 2018, 2019 Martin Lukasek <martin@lukasek.cz>
 ###### This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
@@ -22,6 +22,9 @@
 
 
 ### Revisions:
+
+#### *** 20 July 2019 ***
+Created project for GSM.  
 
 #### *** 20 June 2019 ***
 Split of Nightscout read and display code (this should allow simpler user display code update and more different "faces" from users).  
