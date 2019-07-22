@@ -1,4 +1,4 @@
-# M5_NightscoutMon_GSM
+﻿# M5_NightscoutMon_GSM
 ## M5Stack Nightscout monitor with GSM/GPRS support
 
 ##### M5Stack Nightscout monitor<br/>Copyright (C) 2018, 2019 Martin Lukasek <martin@lukasek.cz>
@@ -22,6 +22,14 @@
 
 
 ### Revisions:
+
+#### *** 22 July 2019 ***
+The first working ALPHA version.
+Speaker is pretty noisy, while GSM/GPRS communication is in progress.
+Section [gsm] with key apn is required with your provider APN string. The default is "internet".
+[gsm]
+apn = internet
+The query is repeated every 2 minutes to conserve GPRS data and it also takes some time, so 15 secs would be too fast.
 
 #### *** 20 July 2019 ***
 Created project for GSM.  
