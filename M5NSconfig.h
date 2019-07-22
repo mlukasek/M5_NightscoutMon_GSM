@@ -39,6 +39,7 @@ struct tConfig {
   int dev_mode = 0; // developer mode, do not use, does strange things and changes often ;-)
   char wlanssid[10][32];
   char wlanpass[10][32];
+  char apn[32];
 } ;
 
 void readConfiguration(char *iniFilename, tConfig *cfg);

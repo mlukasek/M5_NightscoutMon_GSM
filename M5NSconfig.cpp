@@ -424,6 +424,7 @@ void readConfiguration(char *iniFilename, tConfig *cfg) {
     Serial.println("NO brightness2");
     cfg->brightness2 = 100;
   }
+  
   if (ini.getValue("config", "brightness3", buffer, bufferLen)) {
     Serial.print("brightness3 = ");
     Serial.println(buffer);
@@ -455,6 +456,15 @@ void readConfiguration(char *iniFilename, tConfig *cfg) {
       Serial.printf("NO [wlan%1d] pass\n", i);
       cfg->wlanpass[i][0] = 0;
     }
+  }
+
+  if (ini.getValue("gsm", "apn", buffer, bufferLen)) {
+    Serial.print("apn = ");
+    Serial.println(buffer);
+    strlcpy(cfg->apn, buffer, 32);
+  } else {
+    Serial.println("NO apn defined");
+    strcpy(cfg->apn, "internet");
   }
 
 }

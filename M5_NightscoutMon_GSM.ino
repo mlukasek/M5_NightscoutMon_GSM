@@ -27,13 +27,14 @@
 #include <WiFi.h>
 #include <WiFiMulti.h>
 #include <HTTPClient.h>
-#include "time.h"
+#include "sys/time.h"
 // #include <util/eu_dst.h>
 #define ARDUINOJSON_USE_LONG_LONG 1
 #include <ArduinoJson.h>
 #include "Free_Fonts.h"
 #include "IniFile.h"
 #include "M5NSconfig.h"
+#include "M5NS_SIM800L.h"
 
 extern const unsigned char m5stack_startup_music[];
 extern const unsigned char WiFi_symbol[];
@@ -47,6 +48,7 @@ extern const unsigned char door_icon16x16[];
 extern const unsigned char warning_icon16x16[];
 extern const unsigned char wifi1_icon16x16[];
 extern const unsigned char wifi2_icon16x16[];
+extern const unsigned char mobile_icon16x16[];
 
 extern const unsigned char bat0_icon16x16[];
 extern const unsigned char bat1_icon16x16[];
@@ -60,7 +62,7 @@ tConfig cfg;
 
 const char* ntpServer = "pool.ntp.org"; // "time.nist.gov", "time.google.com"
 struct tm localTimeInfo;
-int MAX_TIME_RETRY = 30;
+int MAX_TIME_RETRY = 5;
 int lastSec = 61;
 int lastMin = 61;
 char localTimeStr[30];
@@ -87,6 +89,11 @@ unsigned long msCountLog;
 unsigned long msStart;
 static uint8_t lcdBrightness = 10;
 static char *iniFilename = "/M5NS.INI";
+
+#define RX_PIN      16
+#define TX_PIN      17
+#define RESET_PIN   5   
+int gprs = 0;
 
 DynamicJsonDocument JSONdoc(16384);
 time_t lastAlarmTime = 0;
@@ -350,7 +357,7 @@ void buttons_test() {
   }
 }
 
-void wifi_connect() {
+void network_connect() {
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   delay(100);
@@ -369,39 +376,63 @@ void wifi_connect() {
   Serial.print("Wait for WiFi... ");
   M5.Lcd.print("Wait for WiFi... ");
 
-  while(WiFiMulti.run() != WL_CONNECTED) {
+  int retry=0;
+  while(WiFiMulti.run()!=WL_CONNECTED && retry<5) {
       Serial.print(".");
       M5.Lcd.print(".");
+      retry++;
       delay(500);
   }
-
   Serial.println("");
   M5.Lcd.println("");
-  Serial.print("WiFi connected to SSID "); Serial.println(WiFi.SSID());
-  M5.Lcd.print("WiFi SSID "); M5.Lcd.println(WiFi.SSID());
-  Serial.println("IP address: ");
-  M5.Lcd.println("IP address: ");
-  Serial.println(WiFi.localIP());
-  M5.Lcd.println(WiFi.localIP());
-
-  configTime(cfg.timeZone, cfg.dst, ntpServer, "time.nist.gov", "time.google.com");
-  delay(1000);
-  Serial.print("Waiting for time.");
-  int i = 0;
-  while(!getLocalTime(&localTimeInfo)) {
-    Serial.print(".");
+  if(WiFiMulti.run()==WL_CONNECTED) {
+    Serial.print("WiFi connected to SSID "); Serial.println(WiFi.SSID());
+    M5.Lcd.print("WiFi SSID "); M5.Lcd.println(WiFi.SSID());
+    Serial.println("IP address: ");
+    M5.Lcd.println("IP address: ");
+    Serial.println(WiFi.localIP());
+    M5.Lcd.println(WiFi.localIP());
+  
+    configTime(cfg.timeZone, cfg.dst, ntpServer, "time.nist.gov", "time.google.com");
     delay(1000);
-    i++;
-    if (i > MAX_TIME_RETRY) {
-      Serial.print("Gave up waiting for time to have a valid value.");
-      break;
+    
+    Serial.print("Waiting for time... ");
+    M5.Lcd.print("Waiting for time... ");
+    int i = 0;
+    while(!getLocalTime(&localTimeInfo)) {
+      Serial.print(".");
+      M5.Lcd.print(".");
+      delay(1000);
+      i++;
+      if (i > MAX_TIME_RETRY) {
+        Serial.print("Gave up waiting for time to have a valid value.");
+        break;
+      }
     }
+    Serial.println();
+  } else {
+    Serial.println("WiFi not connected, will try to connect GPRS");
+    M5.Lcd.println("Connecting GPRS... ");
+    reset_SIM800();
+    SIM800_beginGPRS(cfg.apn);
+    String json=get_json("http://worldtimeapi.org/api/timezone/Europe/Prague");
+    const size_t capacity = JSON_OBJECT_SIZE(20) + 500;
+    DynamicJsonDocument doc(capacity);
+    deserializeJson(doc, json);
+    struct timeval tv;
+    tv.tv_sec = doc["unixtime"]; // 1563777405
+    if(tv.tv_sec>1563777405)
+      gprs=1;
+    settimeofday(&tv, NULL);
+    // setTimeZone(cfg.timeZone, cfg.dst);
+    setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1); // "CET-1CEST,M3.5.0,M10.5.0/3" or "<02>-2"
+    SIM800_endGPRS();
   }
-  Serial.println();
-  printLocalTime();
 
-  Serial.println("Connection done");
-  M5.Lcd.println("Connection done");
+  printLocalTime();
+  
+  Serial.println("Network connect finished");
+  M5.Lcd.println("Network connect finished");
 }
 
 int8_t getBatteryLevel()
@@ -446,6 +477,12 @@ void setup() {
     SD.begin();
     
     // M5.Speaker.mute();
+
+    // setup possible SIM800L module access
+    pinMode(RESET_PIN, OUTPUT);
+    digitalWrite(RESET_PIN, HIGH);
+    Serial2.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);   
+    delay(100);
 
     // Lcd display
     M5.Lcd.setBrightness(100);
@@ -536,12 +573,13 @@ void setup() {
     M5.Lcd.fillScreen(BLACK);
 
     M5.Lcd.setBrightness(lcdBrightness);
-    wifi_connect();
+    network_connect();
     yield();
 
     M5.Lcd.setBrightness(lcdBrightness);
     M5.Lcd.fillScreen(BLACK);
 
+    Serial.println("DBG back from WIFI setup");
     // fill dummy values to error log
     /*
     for(int i=0; i<10; i++) {
@@ -562,7 +600,12 @@ void setup() {
     // stat startup time
     msStart = millis();
     // update glycemia now
-    msCount = msStart-16000;
+    if(gprs)
+      msCount = msStart-120000;
+    else
+      msCount = msStart-16000;
+
+    Serial.println("DBG setup() END");
 }
 
 void drawArrow(int x, int y, int asize, int aangle, int pwidth, int plength, uint16_t color){
@@ -674,29 +717,42 @@ void drawMiniGraph(struct NSinfo *ns){
 
 int readNightscout(char *url, char *token, struct NSinfo *ns) {
   HTTPClient http;
-  char NSurl[128];
+  char NSurl1[128], NSurl2[128];
   int err=0;
   char tmpstr[32];
+  String json, propjson;
   
+  // configure target server and url
+  if(strncmp(url, "http", 4))
+    strcpy(NSurl1,"https://");
+  else
+    strcpy(NSurl1,"");
+  strcat(NSurl1,url);
+  strcat(NSurl1,"/api/v1/entries.json");
+  if ((token!=NULL) && (strlen(token)>0)){
+    strcat(NSurl1,"?token=");
+    strcat(NSurl1,token);
+  }
+  
+  if(strncmp(url, "http", 4))
+    strcpy(NSurl2,"https://");
+  else
+    strcpy(NSurl2,"");
+  strcat(NSurl2,url);
+  strcat(NSurl2,"/api/v2/properties/iob,cob,delta,loop,basal");
+  if (strlen(token) > 0){
+    strcat(NSurl2,"&token=");
+    strcat(NSurl2,token);
+  }
+
+  Serial.println("DBG readNightscout(...) BEGIN");
   if((WiFiMulti.run() == WL_CONNECTED)) {
-    // configure target server and url
-    if(strncmp(url, "http", 4))
-      strcpy(NSurl,"https://");
-    else
-      strcpy(NSurl,"");
-    strcat(NSurl,url);
-    strcat(NSurl,"/api/v1/entries.json");
-    if ((token!=NULL) && (strlen(token)>0)){
-      strcat(NSurl,"?token=");
-      strcat(NSurl,token);
-    }
 
     M5.Lcd.fillRect(icon_xpos[0], icon_ypos[0], 16, 16, BLACK);
     drawIcon(icon_xpos[0], icon_ypos[0], (uint8_t*)wifi2_icon16x16, TFT_BLUE);
     
-    Serial.print("JSON query NSurl = \'");Serial.print(NSurl);Serial.print("\'\n");
-    http.begin(NSurl); //HTTP
-    
+    Serial.print("JSON SGV query NSurl = \'");Serial.print(NSurl1);Serial.print("\'\n");
+    http.begin(NSurl1); //HTTP
     Serial.print("[HTTP] GET...\n");
     // start connection and send HTTP header
     int httpCode = http.GET();
@@ -708,91 +764,7 @@ int readNightscout(char *url, char *token, struct NSinfo *ns) {
 
       // file found at server
       if(httpCode == HTTP_CODE_OK) {
-        String json = http.getString();
-        // Serial.println(json);
-        // const size_t capacity = JSON_ARRAY_SIZE(10) + 10*JSON_OBJECT_SIZE(19) + 3840;
-        // Serial.print("JSON size needed= "); Serial.print(capacity); 
-        Serial.print("Free Heap = "); Serial.println(ESP.getFreeHeap());
-        auto JSONerr = deserializeJson(JSONdoc, json);
-        Serial.println("JSON deserialized OK");
-        JsonArray arr=JSONdoc.as<JsonArray>();
-        Serial.print("JSON array size = "); Serial.println(arr.size());
-        if (JSONerr || arr.size()==0) {   //Check for errors in parsing
-          if(JSONerr) {
-            err=1001; // "JSON parsing failed"
-          } else {
-            err=1002; // "No data from Nightscout"
-          }
-          addErrorLog(err);
-        } else {
-          JsonObject obj; 
-          int sgvindex = 0;
-          do {
-            obj=JSONdoc[sgvindex].as<JsonObject>();
-            sgvindex++;
-          } while ((!obj.containsKey("sgv")) && (sgvindex<(arr.size()-1)));
-          sgvindex--;
-          if(sgvindex<0 || sgvindex>(arr.size()-1))
-            sgvindex=0;
-          strlcpy(ns->sensDev, JSONdoc[sgvindex]["device"] | "N/A", 64);
-          ns->is_xDrip = obj.containsKey("xDrip_raw");
-          ns->rawtime = JSONdoc[sgvindex]["date"].as<long long>(); // sensTime is time in milliseconds since 1970, something like 1555229938118
-          strlcpy(ns->sensDir, JSONdoc[sgvindex]["direction"] | "N/A", 32);
-          ns->sensSgv = JSONdoc[sgvindex]["sgv"]; // get value of sensor measurement
-          ns->sensTime = ns->rawtime / 1000; // no milliseconds, since 2000 would be - 946684800, but ok
-          for(int i=0; i<=9; i++) {
-            ns->last10sgv[i]=JSONdoc[i]["sgv"];
-            ns->last10sgv[i]/=18.0;
-          }
-          ns->sensSgvMgDl = ns->sensSgv;
-          // internally we work in mmol/L
-          ns->sensSgv/=18.0;
-          
-          localtime_r(&ns->sensTime, &ns->sensTm);
-          
-          ns->arrowAngle = 180;
-          if(strcmp(ns->sensDir,"DoubleDown")==0)
-            ns->arrowAngle = 90;
-          else 
-            if(strcmp(ns->sensDir,"SingleDown")==0)
-              ns->arrowAngle = 75;
-            else 
-                if(strcmp(ns->sensDir,"FortyFiveDown")==0)
-                  ns->arrowAngle = 45;
-                else 
-                    if(strcmp(ns->sensDir,"Flat")==0)
-                      ns->arrowAngle = 0;
-                    else 
-                        if(strcmp(ns->sensDir,"FortyFiveUp")==0)
-                          ns->arrowAngle = -45;
-                        else 
-                            if(strcmp(ns->sensDir,"SingleUp")==0)
-                              ns->arrowAngle = -75;
-                            else 
-                                if(strcmp(ns->sensDir,"DoubleUp")==0)
-                                  ns->arrowAngle = -90;
-                                else 
-                                    if(strcmp(ns->sensDir,"NONE")==0)
-                                      ns->arrowAngle = 180;
-                                    else 
-                                        if(strcmp(ns->sensDir,"NOT COMPUTABLE")==0)
-                                          ns->arrowAngle = 180;
-                                          
-          Serial.print("sensDev = ");
-          Serial.println(ns->sensDev);
-          Serial.print("sensTime = ");
-          Serial.print(ns->sensTime);
-          sprintf(tmpstr, " (JSON %lld)", (long long) ns->rawtime);
-          Serial.print(tmpstr);
-          sprintf(tmpstr, " = %s", ctime(&ns->sensTime));
-          Serial.print(tmpstr);
-          Serial.print("sensSgv = ");
-          Serial.println(ns->sensSgv);
-          Serial.print("sensDir = ");
-          Serial.println(ns->sensDir);
-          // Serial.print(ns->sensTm.tm_year+1900); Serial.print(" / "); Serial.print(ns->sensTm.tm_mon+1); Serial.print(" / "); Serial.println(ns->sensTm.tm_mday);
-          Serial.print("Sensor time: "); Serial.print(ns->sensTm.tm_hour); Serial.print(":"); Serial.print(ns->sensTm.tm_min); Serial.print(":"); Serial.print(ns->sensTm.tm_sec); Serial.print(" DST "); Serial.println(ns->sensTm.tm_isdst);
-        } 
+        json = http.getString();
       } else {
         addErrorLog(httpCode);
         err=httpCode;
@@ -803,80 +775,18 @@ int readNightscout(char *url, char *token, struct NSinfo *ns) {
     }
     http.end();
 
-    if(err!=0)
-      return err;
-      
-    // the second query 
-    if(strncmp(url, "http", 4))
-      strcpy(NSurl,"https://");
-    else
-      strcpy(NSurl,"");
-    strcat(NSurl,url);
-    strcat(NSurl,"/api/v2/properties/iob,cob,delta,loop,basal");
-    if (strlen(token) > 0){
-      strcat(NSurl,"&token=");
-      strcat(NSurl,token);
-    }
-    
     M5.Lcd.fillRect(icon_xpos[0], icon_ypos[0], 16, 16, BLACK);
     drawIcon(icon_xpos[0], icon_ypos[0], (uint8_t*)wifi1_icon16x16, TFT_BLUE);
 
-    Serial.print("Properties query NSurl = \'");Serial.print(NSurl);Serial.print("\'\n");
-    http.begin(NSurl); //HTTP
+    Serial.print("Properties query NSurl = \'");Serial.print(NSurl2);Serial.print("\'\n");
+    http.begin(NSurl2); //HTTP
     Serial.print("[HTTP] GET properties...\n");
     httpCode = http.GET();
     if(httpCode > 0) {
       Serial.printf("[HTTP] GET properties... code: %d\n", httpCode);
       if(httpCode == HTTP_CODE_OK) {
         // const char* propjson = "{\"iob\":{\"iob\":0,\"activity\":0,\"source\":\"OpenAPS\",\"device\":\"openaps://Spike iPhone 8 Plus\",\"mills\":1557613521000,\"display\":\"0\",\"displayLine\":\"IOB: 0U\"},\"cob\":{\"cob\":0,\"source\":\"OpenAPS\",\"device\":\"openaps://Spike iPhone 8 Plus\",\"mills\":1557613521000,\"treatmentCOB\":{\"decayedBy\":\"2019-05-11T23:05:00.000Z\",\"isDecaying\":0,\"carbs_hr\":20,\"rawCarbImpact\":0,\"cob\":7,\"lastCarbs\":{\"_id\":\"5cd74c26156712edb4b32455\",\"enteredBy\":\"Martin\",\"eventType\":\"Carb Correction\",\"reason\":\"\",\"carbs\":7,\"duration\":0,\"created_at\":\"2019-05-11T22:24:00.000Z\",\"mills\":1557613440000,\"mgdl\":67}},\"display\":0,\"displayLine\":\"COB: 0g\"},\"delta\":{\"absolute\":-4,\"elapsedMins\":4.999483333333333,\"interpolated\":false,\"mean5MinsAgo\":69,\"mgdl\":-4,\"scaled\":-0.2,\"display\":\"-0.2\",\"previous\":{\"mean\":69,\"last\":69,\"mills\":1557613221946,\"sgvs\":[{\"mgdl\":69,\"mills\":1557613221946,\"device\":\"MIAOMIAO\",\"direction\":\"Flat\",\"filtered\":92588,\"unfiltered\":92588,\"noise\":1,\"rssi\":100}]}}}";
-        String propjson = http.getString();
-        auto propJSONerr = deserializeJson(JSONdoc, propjson);
-        if(propJSONerr) {
-          err=1003; // "JSON2 parsing failed"
-          addErrorLog(err);
-        } else {
-          Serial.println("Deserialized the second JSON and OK");
-          JsonObject iob = JSONdoc["iob"];
-          ns->iob = iob["iob"]; // 0
-          strncpy(ns->iob_display, iob["display"] | "N/A", 16); // 0
-          strncpy(ns->iob_displayLine, iob["displayLine"] | "IOB: N/A", 16); // "IOB: 0U"
-          // Serial.println("IOB OK");
-          
-          JsonObject cob = JSONdoc["cob"];
-          ns->cob = cob["cob"]; // 0
-          strncpy(ns->cob_display, cob["display"] | "N/A", 16); // 0
-          strncpy(ns->cob_displayLine, cob["displayLine"] | "COB: N/A", 16); // "COB: 0g"
-          // Serial.println("COB OK");
-          
-          JsonObject delta = JSONdoc["delta"];
-          ns->delta_absolute = delta["absolute"]; // -4
-          ns->delta_elapsedMins = delta["elapsedMins"]; // 4.999483333333333
-          ns->delta_interpolated = delta["interpolated"]; // false
-          ns->delta_mean5MinsAgo = delta["mean5MinsAgo"]; // 69
-          ns->delta_mgdl = delta["mgdl"]; // -4
-          ns->delta_scaled = delta["scaled"]; // -0.2
-          strncpy(ns->delta_display, delta["display"] | "", 16); // "-0.2"
-          // Serial.println("DELTA OK");
-          
-          JsonObject loop_obj = JSONdoc["loop"];
-          JsonObject loop_display = loop_obj["display"];
-          strncpy(tmpstr, loop_display["symbol"] | "?", 4); // "⌁"
-          ns->loop_display_symbol = tmpstr[0];
-          strncpy(ns->loop_display_code, loop_display["code"] | "N/A", 16); // "enacted"
-          strncpy(ns->loop_display_label, loop_display["label"] | "N/A", 16); // "Enacted"
-          // Serial.println("LOOP OK");
-
-          JsonObject basal = JSONdoc["basal"];
-          strncpy(ns->basal_display, basal["display"] | "N/A", 16); // "T: 0.950U"      
-          // Serial.println("BASAL OK");
-          
-          JsonObject basal_current_doc = JSONdoc["basal"]["current"];
-          ns->basal_current = basal_current_doc["basal"]; // 0.1
-          ns->basal_tempbasal = basal_current_doc["tempbasal"]; // 0.1
-          ns->basal_combobolusbasal = basal_current_doc["combobolusbasal"]; // 0
-          ns->basal_totalbasal = basal_current_doc["totalbasal"]; // 0.1
-          // Serial.println("LOOP OK");
-        } 
+        propjson = http.getString();
       } else {
         addErrorLog(httpCode);
         err=httpCode;
@@ -886,12 +796,180 @@ int readNightscout(char *url, char *token, struct NSinfo *ns) {
       err=httpCode;
     }
     http.end();
+
+    M5.Lcd.fillRect(icon_xpos[0], icon_ypos[0], 16, 16, BLACK);
+
   } else {
-    // WiFi not connected
-    ESP.restart();
+    // WiFi not connected - will try to read form GSM/GPRS
+    
+    Serial.println("WiFi not connected, will try to connect GPRS");
+    // reset_SIM800();
+    M5.Lcd.fillRect(icon_xpos[0], icon_ypos[0], 16, 16, BLACK);
+    drawIcon(icon_xpos[0], icon_ypos[0], (uint8_t*)mobile_icon16x16, TFT_BLUE);
+    int gprs_retries=0;
+    do {
+      if(!SIM800_beginGPRS(cfg.apn)) {
+        json=get_json(NSurl1);
+        propjson=get_json(NSurl2);
+        SIM800_endGPRS();
+      } else {
+        json="";
+        propjson="";
+      }
+
+      if(json.length()<5 && propjson.length()<5)
+        reset_SIM800();
+        
+      gprs_retries++;
+    } while(json.length()<5 && propjson.length()<5 && gprs_retries<5);
+    if(gprs_retries>=5) {
+      Serial.println("DBG readNightscout(...) END - FORCING RESTART");
+      ESP.restart();
+    }
+    M5.Lcd.fillRect(icon_xpos[0], icon_ypos[0], 16, 16, BLACK);
   }
 
-  M5.Lcd.fillRect(icon_xpos[0], icon_ypos[0], 16, 16, BLACK);
+  Serial.print("Free Heap = "); Serial.println(ESP.getFreeHeap());
+  
+  Serial.print("The 1st json=\'"); Serial.print(json); Serial.println("\'");
+  if(json.length()>5) {
+    // const size_t capacity = JSON_ARRAY_SIZE(10) + 10*JSON_OBJECT_SIZE(19) + 3840;
+    // Serial.print("JSON size needed= "); Serial.print(capacity); 
+    auto JSONerr = deserializeJson(JSONdoc, json);
+    Serial.println("JSON deserialized OK");
+    JsonArray arr=JSONdoc.as<JsonArray>();
+    Serial.print("JSON array size = "); Serial.println(arr.size());
+    if (JSONerr || arr.size()==0) {   //Check for errors in parsing
+      if(JSONerr) {
+        err=1001; // "JSON parsing failed"
+      } else {
+        err=1002; // "No data from Nightscout"
+      }
+      addErrorLog(err);
+    } else {
+      JsonObject obj; 
+      int sgvindex = 0;
+      do {
+        obj=JSONdoc[sgvindex].as<JsonObject>();
+        sgvindex++;
+      } while ((!obj.containsKey("sgv")) && (sgvindex<(arr.size()-1)));
+      sgvindex--;
+      if(sgvindex<0 || sgvindex>(arr.size()-1))
+        sgvindex=0;
+      strlcpy(ns->sensDev, JSONdoc[sgvindex]["device"] | "N/A", 64);
+      ns->is_xDrip = obj.containsKey("xDrip_raw");
+      ns->rawtime = JSONdoc[sgvindex]["date"].as<long long>(); // sensTime is time in milliseconds since 1970, something like 1555229938118
+      strlcpy(ns->sensDir, JSONdoc[sgvindex]["direction"] | "N/A", 32);
+      ns->sensSgv = JSONdoc[sgvindex]["sgv"]; // get value of sensor measurement
+      ns->sensTime = ns->rawtime / 1000; // no milliseconds, since 2000 would be - 946684800, but ok
+      for(int i=0; i<=9; i++) {
+        ns->last10sgv[i]=JSONdoc[i]["sgv"];
+        ns->last10sgv[i]/=18.0;
+      }
+      ns->sensSgvMgDl = ns->sensSgv;
+      // internally we work in mmol/L
+      ns->sensSgv/=18.0;
+      
+      localtime_r(&ns->sensTime, &ns->sensTm);
+      
+      ns->arrowAngle = 180;
+      if(strcmp(ns->sensDir,"DoubleDown")==0)
+        ns->arrowAngle = 90;
+      else 
+        if(strcmp(ns->sensDir,"SingleDown")==0)
+          ns->arrowAngle = 75;
+        else 
+            if(strcmp(ns->sensDir,"FortyFiveDown")==0)
+              ns->arrowAngle = 45;
+            else 
+                if(strcmp(ns->sensDir,"Flat")==0)
+                  ns->arrowAngle = 0;
+                else 
+                    if(strcmp(ns->sensDir,"FortyFiveUp")==0)
+                      ns->arrowAngle = -45;
+                    else 
+                        if(strcmp(ns->sensDir,"SingleUp")==0)
+                          ns->arrowAngle = -75;
+                        else 
+                            if(strcmp(ns->sensDir,"DoubleUp")==0)
+                              ns->arrowAngle = -90;
+                            else 
+                                if(strcmp(ns->sensDir,"NONE")==0)
+                                  ns->arrowAngle = 180;
+                                else 
+                                    if(strcmp(ns->sensDir,"NOT COMPUTABLE")==0)
+                                      ns->arrowAngle = 180;
+                                      
+      Serial.print("sensDev = ");
+      Serial.println(ns->sensDev);
+      Serial.print("sensTime = ");
+      Serial.print(ns->sensTime);
+      sprintf(tmpstr, " (JSON %lld)", (long long) ns->rawtime);
+      Serial.print(tmpstr);
+      sprintf(tmpstr, " = %s", ctime(&ns->sensTime));
+      Serial.print(tmpstr);
+      Serial.print("sensSgv = ");
+      Serial.println(ns->sensSgv);
+      Serial.print("sensDir = ");
+      Serial.println(ns->sensDir);
+      // Serial.print(ns->sensTm.tm_year+1900); Serial.print(" / "); Serial.print(ns->sensTm.tm_mon+1); Serial.print(" / "); Serial.println(ns->sensTm.tm_mday);
+      Serial.print("Sensor time: "); Serial.print(ns->sensTm.tm_hour); Serial.print(":"); Serial.print(ns->sensTm.tm_min); Serial.print(":"); Serial.print(ns->sensTm.tm_sec); Serial.print(" DST "); Serial.println(ns->sensTm.tm_isdst);
+    } 
+  }
+
+  if(err!=0)
+    return err;
+      
+  Serial.print("The properties json=\'"); Serial.print(propjson); Serial.println("\'");
+  if(propjson.length()>5) {
+    auto propJSONerr = deserializeJson(JSONdoc, propjson);
+    if(propJSONerr) {
+      err=1003; // "JSON2 parsing failed"
+      addErrorLog(err);
+    } else {
+      Serial.println("Deserialized the second JSON and OK");
+      JsonObject iob = JSONdoc["iob"];
+      ns->iob = iob["iob"]; // 0
+      strncpy(ns->iob_display, iob["display"] | "N/A", 16); // 0
+      strncpy(ns->iob_displayLine, iob["displayLine"] | "IOB: N/A", 16); // "IOB: 0U"
+      // Serial.println("IOB OK");
+      
+      JsonObject cob = JSONdoc["cob"];
+      ns->cob = cob["cob"]; // 0
+      strncpy(ns->cob_display, cob["display"] | "N/A", 16); // 0
+      strncpy(ns->cob_displayLine, cob["displayLine"] | "COB: N/A", 16); // "COB: 0g"
+      // Serial.println("COB OK");
+      
+      JsonObject delta = JSONdoc["delta"];
+      ns->delta_absolute = delta["absolute"]; // -4
+      ns->delta_elapsedMins = delta["elapsedMins"]; // 4.999483333333333
+      ns->delta_interpolated = delta["interpolated"]; // false
+      ns->delta_mean5MinsAgo = delta["mean5MinsAgo"]; // 69
+      ns->delta_mgdl = delta["mgdl"]; // -4
+      ns->delta_scaled = delta["scaled"]; // -0.2
+      strncpy(ns->delta_display, delta["display"] | "", 16); // "-0.2"
+      // Serial.println("DELTA OK");
+      
+      JsonObject loop_obj = JSONdoc["loop"];
+      JsonObject loop_display = loop_obj["display"];
+      strncpy(tmpstr, loop_display["symbol"] | "?", 4); // "⌁"
+      ns->loop_display_symbol = tmpstr[0];
+      strncpy(ns->loop_display_code, loop_display["code"] | "N/A", 16); // "enacted"
+      strncpy(ns->loop_display_label, loop_display["label"] | "N/A", 16); // "Enacted"
+      // Serial.println("LOOP OK");
+  
+      JsonObject basal = JSONdoc["basal"];
+      strncpy(ns->basal_display, basal["display"] | "N/A", 16); // "T: 0.950U"      
+      // Serial.println("BASAL OK");
+      
+      JsonObject basal_current_doc = JSONdoc["basal"]["current"];
+      ns->basal_current = basal_current_doc["basal"]; // 0.1
+      ns->basal_tempbasal = basal_current_doc["tempbasal"]; // 0.1
+      ns->basal_combobolusbasal = basal_current_doc["combobolusbasal"]; // 0
+      ns->basal_totalbasal = basal_current_doc["totalbasal"]; // 0.1
+      // Serial.println("LOOP OK");
+    }
+  } 
 
   return err;
 }
@@ -1411,14 +1489,17 @@ void update_glycemia() {
 
 // the loop routine runs over and over again forever
 void loop(){
+  unsigned long upddiff = 15000;
   delay(20);
   buttons_test();
 
-  // update glycemia every 15s
-  if(millis()-msCount>15000) {
+  // update glycemia every 15s / 120s for GPRS
+  if(gprs)
+    upddiff=120000;
+  if(millis()-msCount>upddiff) {
     update_glycemia();
     msCount = millis();  
-    Serial.print("msCount = "); Serial.println(msCount);
+    // Serial.print("msCount = "); Serial.println(msCount);
   } else {
     if((cfg.restart_at_logged_errors>0) && (err_log_count>=cfg.restart_at_logged_errors)) {
       preferences.begin("M5StackNS", false);
